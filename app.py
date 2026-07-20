@@ -1,100 +1,62 @@
-
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
-import re
+from typing import List, Optional
+from openai import OpenAI
+import os
+import math
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class Chunk(BaseModel):
-    chunk_id: str
-    text: str
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class RequestBody(BaseModel):
-    question: str
-    chunks: List[Chunk]
+    query_id: Optional[str] = None
+    query: str
+    candidates: List[str]
 
-def tokenize(text: str):
-    return set(re.findall(r"\b[a-z0-9]+\b", text.lower()))
+def cosine_similarity(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
 
-def split_sentences(text: str):
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-
-def score(question_tokens, sentence):
-    st = tokenize(sentence)
-    if not st:
+    if norm_a == 0 or norm_b == 0:
         return 0.0
-    overlap = len(question_tokens & st)
-    if overlap == 0:
-        return 0.0
-    return overlap / max(len(question_tokens), 1)
+
+    return dot / (norm_a * norm_b)
 
 @app.get("/")
-def health():
-    return {"status":"ok"}
-
-def process(req: RequestBody):
-    if req is None or not req.question.strip():
-        return {
-            "answerable": False,
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": 0.2
-        }
-
-    q_tokens = tokenize(req.question)
-    best_sentence = None
-    best_chunk = None
-    best_score = 0.0
-
-    for chunk in req.chunks:
-        for sent in split_sentences(chunk.text):
-            s = score(q_tokens, sent)
-            if s > best_score:
-                best_score = s
-                best_sentence = sent
-                best_chunk = chunk
-
-    if best_chunk is None or best_score < 0.25:
-        return {
-            "answerable": False,
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": 0.2
-        }
-
-    return {
-        "answerable": True,
-        "answer": best_sentence,
-        "citations": [best_chunk.chunk_id],
-        "confidence": round(min(0.35 + best_score, 0.95),2)
-    }
+def home():
+    return {"status": "ok"}
 
 @app.post("/")
-def root(req: RequestBody):
-    return process(req)
+def rank_candidates(req: RequestBody):
 
-@app.post("/grounded-answer")
-def grounded(req: RequestBody):
-    return process(req)
+    texts = [req.query] + req.candidates
 
-@app.post("/answer")
-def answer(req: RequestBody):
-    return process(req)
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
 
-@app.post("/api")
-def api(req: RequestBody):
-    return process(req)
+    embeddings = [item.embedding for item in response.data]
+
+    query_embedding = embeddings[0]
+    candidate_embeddings = embeddings[1:]
+
+    similarities = []
+
+    for index, embedding in enumerate(candidate_embeddings):
+        score = cosine_similarity(query_embedding, embedding)
+        similarities.append((index, score))
+
+    similarities.sort(key=lambda x: x[1], reverse=True)
+
+    ranking = [idx for idx, _ in similarities[:3]]
+
+    return {"ranking": ranking}
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
